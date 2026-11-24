@@ -1,0 +1,12 @@
+{
+  "hosts": [
+    { "id": "almaz", "name": "almaz", "url": "https://almaz.subcult.tv/" },
+    { "id": "nuc", "name": "nuc", "url": "https://nuc.subcult.tv/" },
+    { "id": "dozor", "name": "dozor", "url": "https://dozor.subcult.tv/" },
+    { "id": "buran", "name": "buran", "url": "https://buran.subcult.tv/" },
+    { "id": "kvant", "name": "kvant", "url": "https://kvant.subcult.tv/" }
+  ],
+  "layouts": [],
+  "rotation": [{ "layout": "all" }],
+  "interval": 30
+}

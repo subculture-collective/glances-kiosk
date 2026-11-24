@@ -1,0 +1,30 @@
+# Glances viewer. The edge Caddy proxies http://glances.subcult.tv here behind Authelia
+# (see README.md). Settings persist in ./data/config.json.
+services:
+  viewer:
+    build: .
+    image: glances-viewer:local
+    container_name: glances-viewer
+    user: "1000:1000"
+    networks:
+      - management
+    volumes:
+      - ./data:/data
+    read_only: true
+    tmpfs:
+      - /tmp:uid=1000,gid=1000,mode=0700
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://127.0.0.1:8080/healthz', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+networks:
+  management:
+    external: true

@@ -1,0 +1,320 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Glances viewer</title>
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #0e0f12; --panel: #16181d; --line: #2a2d34; --fg: #e6e6e6; --mut: #9096a0; --acc: #5aa9ff; --bad: #ff7a7a;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; overflow: hidden; background: var(--bg); color: var(--fg);
+    font: 14px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  body:not(.active) { cursor: none; }
+
+  #stage { position: fixed; inset: 0; display: grid; gap: 2px; background: var(--line); }
+  #stage iframe { width: 100%; height: 100%; min-width: 0; min-height: 0; border: 0; background: var(--bg); }
+  #stage iframe.off { display: none; }
+
+  #hud { position: fixed; top: 12px; right: 12px; display: flex; gap: 6px; opacity: 0; transition: opacity .25s; z-index: 5; }
+  #label { position: fixed; left: 12px; bottom: 12px; padding: 4px 10px; border-radius: 6px; z-index: 5;
+    background: rgba(14,15,18,.85); border: 1px solid var(--line); opacity: 0; transition: opacity .25s; pointer-events: none; }
+  body.active #hud, body.active #label, body.panel-open #hud { opacity: 1; }
+
+  button, select, input[type=text], input[type=number] {
+    font: inherit; color: var(--fg); background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 6px 10px;
+  }
+  button { cursor: pointer; min-width: 36px; }
+  button:hover, button:focus-visible { border-color: var(--acc); outline: none; }
+  button.primary { background: var(--acc); color: #04111f; border-color: var(--acc); font-weight: 600; }
+  #hud button { background: rgba(22,24,29,.92); }
+
+  #panel { position: fixed; top: 0; right: 0; bottom: 0; width: min(440px, 100%); background: var(--panel);
+    border-left: 1px solid var(--line); z-index: 10; display: flex; flex-direction: column; }
+  #panel[hidden] { display: none; }
+  #panel header { display: flex; justify-content: space-between; align-items: center; padding: 14px 16px; border-bottom: 1px solid var(--line); }
+  #panel h1 { font-size: 16px; margin: 0; }
+  #panelBody { flex: 1; overflow: auto; padding: 8px 16px 16px; }
+  #panel footer { padding: 12px 16px; border-top: 1px solid var(--line); display: flex; gap: 10px; align-items: center; }
+  #status { color: var(--mut); flex: 1; }
+  #status.err { color: var(--bad); }
+  section { margin: 18px 0; }
+  h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--mut); margin: 0 0 8px; }
+  .hint { color: var(--mut); font-size: 12px; margin: 6px 0 0; }
+  .row { display: flex; gap: 6px; align-items: center; margin-bottom: 6px; }
+  .row select, .row input[type=text] { flex: 1; min-width: 0; }
+  .layout { border: 1px solid var(--line); border-radius: 8px; padding: 10px; margin-bottom: 10px; }
+  .checks { display: flex; flex-wrap: wrap; gap: 4px 14px; margin-top: 6px; }
+  .checks label { display: flex; gap: 6px; align-items: center; }
+  #offline { position: fixed; left: 12px; top: 12px; z-index: 5; padding: 4px 10px; border-radius: 6px;
+    background: var(--panel); border: 1px solid var(--bad); color: var(--bad); }
+  #offline[hidden] { display: none; }
+  #msg { position: fixed; inset: 0; display: grid; place-items: center; color: var(--mut); }
+  #msg[hidden] { display: none; }
+</style>
+</head>
+<body>
+<main id="stage"></main>
+<div id="msg">Loading…</div>
+<div id="offline" hidden>Can't reach the settings server</div>
+<div id="label"></div>
+<div id="hud">
+  <button id="prev" aria-label="Previous slide" title="Previous (←)">‹</button>
+  <button id="pause" aria-label="Pause rotation" title="Pause on this screen (space)">❚❚</button>
+  <button id="next" aria-label="Next slide" title="Next (→)">›</button>
+  <button id="gear" aria-label="Settings" title="Settings">⚙</button>
+</div>
+<aside id="panel" hidden aria-label="Settings">
+  <header><h1>Settings</h1><button id="close" aria-label="Close settings">✕</button></header>
+  <div id="panelBody"></div>
+  <footer><span id="status" role="status"></span><button id="save" class="primary">Save</button></footer>
+</aside>
+
+<script>
+"use strict";
+const $ = (s) => document.querySelector(s);
+const h = (tag, props = {}, ...kids) => {
+  const e = document.createElement(tag);
+  for (const [k, v] of Object.entries(props)) {
+    if (k === "class") e.className = v;
+    else if (k.startsWith("on")) e.addEventListener(k.slice(2), v);
+    else if (k in e) e[k] = v;
+    else e.setAttribute(k, v);
+  }
+  e.append(...kids);
+  return e;
+};
+
+let cfg = null;          // settings as saved on the server
+let etag = null;
+let slides = [];         // [{key, name, hosts: [id]}]
+let cur = 0;
+let paused = false;      // this browser only
+let timer = null;
+const frames = new Map(); // host id -> iframe (created once, never reloaded by switching slides)
+
+/* ---------- slides ---------- */
+
+function resolveSlides(c) {
+  const ids = new Set(c.hosts.map((x) => x.id));
+  const name = (id) => c.hosts.find((x) => x.id === id).name;
+  const out = [];
+  for (const it of c.rotation) {
+    if (it.host && ids.has(it.host)) {
+      out.push({ key: "h:" + it.host, name: name(it.host), hosts: [it.host] });
+    } else if (it.layout === "all") {
+      out.push({ key: "l:all", name: "All hosts", hosts: c.hosts.map((x) => x.id) });
+    } else if (it.layout) {
+      const l = c.layouts.find((x) => x.id === it.layout);
+      const hs = l ? l.hosts.filter((id) => ids.has(id)) : [];
+      if (hs.length) out.push({ key: "l:" + l.id, name: l.name, hosts: hs });
+    }
+  }
+  return out.length ? out : [{ key: "l:all", name: "All hosts", hosts: c.hosts.map((x) => x.id) }];
+}
+
+function show(i) {
+  cur = ((i % slides.length) + slides.length) % slides.length;
+  const s = slides[cur];
+  const n = s.hosts.length;
+  const cols = Math.ceil(Math.sqrt(n));
+  const rows = Math.ceil(n / cols);
+  const stage = $("#stage");
+  stage.style.gridTemplateColumns = `repeat(${cols}, minmax(0, 1fr))`;
+  stage.style.gridTemplateRows = `repeat(${rows}, minmax(0, 1fr))`;
+  for (const [id, f] of frames) {
+    const pos = s.hosts.indexOf(id);
+    if (pos < 0) { f.classList.add("off"); continue; }
+    const col = (pos % cols) + 1;
+    const span = pos === n - 1 ? cols - col + 1 : 1; // a short last row's final tile fills the row
+    f.style.gridRow = String(Math.floor(pos / cols) + 1);
+    f.style.gridColumn = `${col} / span ${span}`;
+    f.classList.remove("off");
+  }
+  $("#label").textContent = s.name + (paused ? " (paused)" : "");
+}
+
+function schedule() {
+  clearTimeout(timer);
+  timer = null;
+  if (paused || slides.length < 2) return; // one slide: nothing to switch to, nothing reloads
+  timer = setTimeout(() => { show(cur + 1); schedule(); }, cfg.interval * 1000);
+}
+
+function step(d) { show(cur + d); schedule(); }
+
+function setPaused(p) {
+  paused = p;
+  $("#pause").textContent = p ? "▶" : "❚❚";
+  $("#pause").setAttribute("aria-label", p ? "Resume rotation" : "Pause rotation");
+  show(cur);
+  schedule();
+}
+
+/* ---------- applying settings ---------- */
+
+function applyConfig(c) {
+  const prevKey = slides[cur] && slides[cur].key;
+  cfg = c;
+  const want = new Map(c.hosts.map((x) => [x.id, x.url]));
+  for (const [id, f] of frames) {
+    if (!want.has(id) || f.dataset.url !== want.get(id)) { f.remove(); frames.delete(id); }
+  }
+  for (const x of c.hosts) {
+    if (frames.has(x.id)) continue;
+    const f = h("iframe", { title: x.name, class: "off", referrerPolicy: "no-referrer" });
+    f.dataset.url = x.url;
+    f.src = x.url;
+    $("#stage").append(f);
+    frames.set(x.id, f);
+  }
+  slides = resolveSlides(c);
+  const keep = slides.findIndex((s) => s.key === prevKey);
+  $("#msg").hidden = true;
+  show(keep >= 0 ? keep : 0);
+  schedule();
+}
+
+async function poll(first) {
+  try {
+    const res = await fetch("/api/config", { cache: "no-store", headers: etag ? { "If-None-Match": etag } : {} });
+    if (res.status === 304) return online(true);
+    if (!res.ok) throw new Error(res.status);
+    etag = res.headers.get("ETag");
+    applyConfig(await res.json());
+    online(true);
+  } catch (e) {
+    // An expired Authelia session redirects to another origin, which looks like a failed fetch.
+    // A reload sends the browser to the login page.
+    try {
+      const r = await fetch("/healthz", { redirect: "manual", cache: "no-store" });
+      if (r.type === "opaqueredirect") return location.reload();
+    } catch (_) { /* really offline */ }
+    online(false);
+    if (first) $("#msg").textContent = "Can't load settings. Retrying…";
+  }
+}
+function online(ok) { $("#offline").hidden = ok; }
+
+/* ---------- settings panel ---------- */
+
+let draft = null;
+const refOf = (it) => (it.host ? "host:" + it.host : "layout:" + it.layout);
+const parseRef = (v) => { const [k, id] = v.split(":"); return { [k]: id }; };
+const setStatus = (t, err) => { const s = $("#status"); s.textContent = t; s.className = err ? "err" : ""; };
+
+function openPanel() {
+  draft = JSON.parse(JSON.stringify({ layouts: cfg.layouts, rotation: cfg.rotation, interval: cfg.interval }));
+  document.body.classList.add("panel-open");
+  $("#panel").hidden = false;
+  setStatus("");
+  renderPanel();
+}
+function closePanel() {
+  $("#panel").hidden = true;
+  document.body.classList.remove("panel-open");
+}
+
+function renderPanel() {
+  const body = $("#panelBody");
+  body.replaceChildren();
+
+  body.append(h("section", {},
+    h("h2", {}, "Seconds per slide"),
+    h("input", { type: "number", min: 5, max: 3600, value: draft.interval,
+      oninput: (e) => { draft.interval = parseInt(e.target.value, 10); } })));
+
+  const rot = h("section", {}, h("h2", {}, "Rotation"));
+  draft.rotation.forEach((it, i) => {
+    const sel = h("select", { "aria-label": "Slide " + (i + 1), onchange: (e) => { draft.rotation[i] = parseRef(e.target.value); } },
+      h("optgroup", { label: "Hosts" }, ...cfg.hosts.map((x) => h("option", { value: "host:" + x.id }, x.name))),
+      h("optgroup", { label: "Layouts" },
+        h("option", { value: "layout:all" }, "All hosts"),
+        ...draft.layouts.map((l) => h("option", { value: "layout:" + l.id }, l.name))));
+    sel.value = refOf(it);
+    const move = (d) => () => {
+      const j = i + d;
+      if (j < 0 || j >= draft.rotation.length) return;
+      [draft.rotation[i], draft.rotation[j]] = [draft.rotation[j], draft.rotation[i]];
+      renderPanel();
+    };
+    rot.append(h("div", { class: "row" }, sel,
+      h("button", { "aria-label": "Move up", onclick: move(-1) }, "↑"),
+      h("button", { "aria-label": "Move down", onclick: move(1) }, "↓"),
+      h("button", { "aria-label": "Remove from rotation", onclick: () => { draft.rotation.splice(i, 1); renderPanel(); } }, "✕")));
+  });
+  rot.append(h("button", { onclick: () => { draft.rotation.push({ layout: "all" }); renderPanel(); } }, "+ Add slide"),
+    h("p", { class: "hint" }, "One slide stays on screen and never reloads. Two or more rotate."));
+  body.append(rot);
+
+  const lay = h("section", {}, h("h2", {}, "Layouts (several hosts on one screen)"));
+  draft.layouts.forEach((l, i) => {
+    lay.append(h("div", { class: "layout" },
+      h("div", { class: "row" },
+        h("input", { type: "text", value: l.name, maxLength: 60, "aria-label": "Layout name",
+          oninput: (e) => { l.name = e.target.value; },
+          onchange: renderPanel }),
+        h("button", { "aria-label": "Delete layout", onclick: () => {
+          const ref = { layout: l.id };
+          draft.layouts.splice(i, 1);
+          draft.rotation = draft.rotation.filter((it) => it.layout !== ref.layout);
+          renderPanel();
+        } }, "✕")),
+      h("div", { class: "checks" }, ...cfg.hosts.map((x) =>
+        h("label", {}, h("input", { type: "checkbox", checked: l.hosts.includes(x.id),
+          onchange: (e) => {
+            l.hosts = cfg.hosts.map((y) => y.id).filter((id) => (id === x.id ? e.target.checked : l.hosts.includes(id)));
+          } }), x.name)))));
+  });
+  lay.append(h("button", { onclick: () => {
+    draft.layouts.push({ id: "l" + Date.now().toString(36), name: "New layout", hosts: cfg.hosts.map((x) => x.id) });
+    renderPanel();
+  } }, "+ Add layout"));
+  body.append(lay);
+}
+
+async function save() {
+  setStatus("Saving…");
+  try {
+    const res = await fetch("/api/config", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(draft) });
+    const data = await res.json();
+    if (!res.ok) return setStatus(data.error || "Save failed", true);
+    etag = null; // next poll re-reads the saved file
+    applyConfig(data);
+    setStatus("Saved");
+  } catch (e) {
+    setStatus("Save failed: " + e.message, true);
+  }
+}
+
+/* ---------- wiring ---------- */
+
+let idle = null;
+function activity() {
+  document.body.classList.add("active");
+  clearTimeout(idle);
+  idle = setTimeout(() => document.body.classList.remove("active"), 3000);
+}
+for (const ev of ["mousemove", "touchstart", "keydown", "pointerdown"]) addEventListener(ev, activity, { passive: true });
+
+$("#prev").onclick = () => step(-1);
+$("#next").onclick = () => step(1);
+$("#pause").onclick = () => setPaused(!paused);
+$("#gear").onclick = () => ($("#panel").hidden ? openPanel() : closePanel());
+$("#close").onclick = closePanel;
+$("#save").onclick = save;
+addEventListener("keydown", (e) => {
+  if (/^(INPUT|SELECT|TEXTAREA)$/.test(e.target.tagName)) return;
+  if (e.key === "ArrowRight") step(1);
+  else if (e.key === "ArrowLeft") step(-1);
+  else if (e.key === " ") { e.preventDefault(); setPaused(!paused); }
+  else if (e.key === "Escape") closePanel();
+});
+
+poll(true);
+setInterval(poll, 15000);
+</script>
+</body>
+</html>
